@@ -129,11 +129,11 @@ func run(ctx context.Context, cfg *config.Config) error {
 		case <-lsClient.Done():
 			slog.Warn("lightstreamer stream ended unexpectedly; attempting reconnection")
 			lsClient.Disconnect()
-			
+
 			// Implement exponential backoff retry logic
 			delay := time.Duration(cfg.InitialRetryDelay) * time.Second
 			maxDelay := time.Duration(cfg.MaxRetryDelay) * time.Second
-			
+
 			var reconnected bool
 			for attempt := 1; attempt <= cfg.MaxReconnectAttempts; attempt++ {
 				if attempt > 1 {
@@ -143,10 +143,10 @@ func run(ctx context.Context, cfg *config.Config) error {
 						"delay", delay,
 					)
 				}
-				
+
 				// Wait before retry (exponential backoff)
 				time.Sleep(delay)
-				
+
 				// Re-authenticate with IG REST API
 				newSession, err := igClient.CreateSession(cfg.Username, cfg.Password)
 				if err != nil {
@@ -161,7 +161,7 @@ func run(ctx context.Context, cfg *config.Config) error {
 					}
 					continue
 				}
-				
+
 				// Attempt to reconnect stream
 				newLS, err := connectAndSubscribe(cfg, newSession, pub, priceStore)
 				if err != nil {
@@ -176,7 +176,7 @@ func run(ctx context.Context, cfg *config.Config) error {
 					}
 					continue
 				}
-				
+
 				// Success!
 				session = newSession
 				lsClient = newLS
@@ -184,7 +184,7 @@ func run(ctx context.Context, cfg *config.Config) error {
 				slog.Info("stream reconnection successful", "attempt", attempt)
 				break
 			}
-			
+
 			if !reconnected {
 				return fmt.Errorf("stream reconnection failed after %d attempts", cfg.MaxReconnectAttempts)
 			}
