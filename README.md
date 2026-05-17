@@ -32,6 +32,9 @@ source .env && ./ig-stream
 | `SQLITE_DIR` | | `.` | Directory in which to create price tick databases |
 | `ORDER_PAUSE_HOUR` | | `22` | UTC hour at which order processing is paused (0-23) |
 | `ORDER_RESUME_MINS` | | `30` | Minutes after pause hour before orders resume |
+| `MAX_RECONNECT_ATTEMPTS` | | `10` | Maximum reconnection attempts after stream failure |
+| `INITIAL_RETRY_DELAY` | | `2` | Initial retry delay in seconds |
+| `MAX_RETRY_DELAY` | | `300` | Maximum retry delay in seconds (5 minutes) |
 
 ## Architecture overview
 
@@ -121,6 +124,25 @@ Order execution is paused at 22:00 UTC and the Lightstreamer session is
 disconnected and reconnected to keep session tokens valid.  Orders resume at
 22:30 UTC.  Orders received during the pause window are rejected with a log
 warning.
+
+## Reconnection and error handling
+
+The service implements robust reconnection logic with exponential backoff to handle:
+
+### Unexpected stream disconnections
+When the Lightstreamer stream ends unexpectedly (network issues, server-side disconnects), the service:
+1. Attempts to re-authenticate with IG REST API
+2. Reconnects to Lightstreamer with fresh subscriptions
+3. Uses exponential backoff: delays double on each retry (2s → 4s → 8s → 16s...) up to `MAX_RETRY_DELAY`
+4. Only exits after `MAX_RECONNECT_ATTEMPTS` exhausted
+
+### LOOP rebind failures
+When Lightstreamer sends a LOOP message (normal server-side session rebind), the service:
+1. Attempts to rebind the existing session
+2. Uses exponential backoff on failures (2s → 4s → 8s → 16s...) up to `MAX_RETRY_DELAY`
+3. Only closes connection after `MAX_RECONNECT_ATTEMPTS` exhausted
+
+All retry attempts are logged with attempt number and delay for troubleshooting.
 
 ---
 

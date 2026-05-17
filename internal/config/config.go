@@ -39,6 +39,11 @@ type Config struct {
 	OrderPauseHour int
 	// Duration in minutes after OrderPauseHour at which orders resume (default 30)
 	OrderResumeMins int
+
+	// Reconnection retry parameters
+	MaxReconnectAttempts int // Maximum attempts to reconnect after stream failure (default 10)
+	InitialRetryDelay    int // Initial retry delay in seconds (default 2)
+	MaxRetryDelay        int // Maximum retry delay in seconds (default 300, i.e., 5 minutes)
 }
 
 // Load reads configuration from environment variables, returning an error if
@@ -120,18 +125,48 @@ func Load() (*Config, error) {
 		resumeMins = n
 	}
 
+	maxReconnectAttempts := 10
+	if v := os.Getenv("MAX_RECONNECT_ATTEMPTS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return nil, fmt.Errorf("MAX_RECONNECT_ATTEMPTS must be a positive integer, got %q", v)
+		}
+		maxReconnectAttempts = n
+	}
+
+	initialRetryDelay := 2
+	if v := os.Getenv("INITIAL_RETRY_DELAY"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return nil, fmt.Errorf("INITIAL_RETRY_DELAY must be a positive integer, got %q", v)
+		}
+		initialRetryDelay = n
+	}
+
+	maxRetryDelay := 300
+	if v := os.Getenv("MAX_RETRY_DELAY"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return nil, fmt.Errorf("MAX_RETRY_DELAY must be a positive integer, got %q", v)
+		}
+		maxRetryDelay = n
+	}
+
 	return &Config{
-		Username:        username,
-		Password:        password,
-		APIKey:          apiKey,
-		AccType:         accType,
-		AccNumber:       accNumber,
-		Epics:           epics,
-		ZMQPubAddr:      optional("ZMQ_PUB_ADDR", "tcp://127.0.0.1:5555"),
-		ZMQSubAddr:      optional("ZMQ_SUB_ADDR", "tcp://127.0.0.1:5556"),
-		SQLiteDir:       optional("SQLITE_DIR", "."),
-		OrderPauseHour:  pauseHour,
-		OrderResumeMins: resumeMins,
+		Username:             username,
+		Password:             password,
+		APIKey:               apiKey,
+		AccType:              accType,
+		AccNumber:            accNumber,
+		Epics:                epics,
+		ZMQPubAddr:           optional("ZMQ_PUB_ADDR", "tcp://127.0.0.1:5555"),
+		ZMQSubAddr:           optional("ZMQ_SUB_ADDR", "tcp://127.0.0.1:5556"),
+		SQLiteDir:            optional("SQLITE_DIR", "."),
+		OrderPauseHour:       pauseHour,
+		OrderResumeMins:      resumeMins,
+		MaxReconnectAttempts: maxReconnectAttempts,
+		InitialRetryDelay:    initialRetryDelay,
+		MaxRetryDelay:        maxRetryDelay,
 	}, nil
 }
 

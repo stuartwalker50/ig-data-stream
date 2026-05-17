@@ -127,16 +127,59 @@ func run(ctx context.Context, cfg *config.Config) error {
 			return nil
 
 		case <-lsClient.Done():
-			slog.Warn("lightstreamer stream ended unexpectedly; reconnecting")
+			slog.Warn("lightstreamer stream ended unexpectedly; attempting reconnection")
 			lsClient.Disconnect()
-			newSession, err := igClient.CreateSession(cfg.Username, cfg.Password)
-			if err != nil {
-				return fmt.Errorf("stream reconnect re-auth failed: %w", err)
+
+			// Implement exponential backoff retry logic
+			delay := time.Duration(cfg.InitialRetryDelay) * time.Second
+			maxDelay := time.Duration(cfg.MaxRetryDelay) * time.Second
+
+			var reconnected bool
+			for attempt := 1; attempt <= cfg.MaxReconnectAttempts; attempt++ {
+				if attempt > 1 {
+					// Wait before retry (exponential backoff)
+					time.Sleep(delay)
+					slog.Info("stream reconnection retry",
+						"attempt", attempt,
+						"max_attempts", cfg.MaxReconnectAttempts,
+						"delay", delay,
+					)
+				}
+
+				// Re-authenticate with IG REST API
+				newSession, err := igClient.CreateSession(cfg.Username, cfg.Password)
+				if err != nil {
+					slog.Warn("stream reconnect re-auth failed",
+						"attempt", attempt,
+						"max_attempts", cfg.MaxReconnectAttempts,
+						"err", err,
+					)
+					delay = calculateNextDelay(delay, maxDelay)
+					continue
+				}
+
+				// Attempt to reconnect stream
+				newLS, err := connectAndSubscribe(cfg, newSession, pub, priceStore)
+				if err != nil {
+					slog.Warn("stream reconnect failed",
+						"attempt", attempt,
+						"max_attempts", cfg.MaxReconnectAttempts,
+						"err", err,
+					)
+					delay = calculateNextDelay(delay, maxDelay)
+					continue
+				}
+
+				// Success!
+				session = newSession
+				lsClient = newLS
+				reconnected = true
+				slog.Info("stream reconnection successful", "attempt", attempt)
+				break
 			}
-			session = newSession
-			lsClient, err = connectAndSubscribe(cfg, session, pub, priceStore)
-			if err != nil {
-				return fmt.Errorf("stream reconnect failed: %w", err)
+
+			if !reconnected {
+				return fmt.Errorf("stream reconnection failed after %d attempts", cfg.MaxReconnectAttempts)
 			}
 
 		case <-pauseCh:
@@ -178,7 +221,14 @@ func connectAndSubscribe(
 ) (*lightstreamer.Client, error) {
 	lsPassword := "CST-" + session.CST + "|XST-" + session.XSecurityToken
 
-	lsClient := lightstreamer.New(session.LightstreamerEndpoint, cfg.AccNumber, lsPassword)
+	lsClient := lightstreamer.NewWithRetry(
+		session.LightstreamerEndpoint,
+		cfg.AccNumber,
+		lsPassword,
+		cfg.MaxReconnectAttempts,
+		time.Duration(cfg.InitialRetryDelay)*time.Second,
+		time.Duration(cfg.MaxRetryDelay)*time.Second,
+	)
 	if err := lsClient.Connect(); err != nil {
 		return nil, err
 	}
@@ -493,4 +543,13 @@ func parseInt64(s string) int64 {
 	}
 	n, _ := strconv.ParseInt(s, 10, 64)
 	return n
+}
+
+// calculateNextDelay doubles the delay up to maxDelay for exponential backoff.
+func calculateNextDelay(currentDelay, maxDelay time.Duration) time.Duration {
+	nextDelay := currentDelay * 2
+	if nextDelay > maxDelay {
+		return maxDelay
+	}
+	return nextDelay
 }

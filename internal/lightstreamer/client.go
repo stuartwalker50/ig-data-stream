@@ -75,10 +75,20 @@ type Client struct {
 	// It is never replaced; use doneOnce to guard the single close.
 	done     chan struct{}
 	doneOnce sync.Once
+
+	// Retry configuration
+	maxRetryAttempts int
+	initialRetryDelay time.Duration
+	maxRetryDelay     time.Duration
 }
 
 // New creates a new Lightstreamer Client.
 func New(baseURL, user, password string) *Client {
+	return NewWithRetry(baseURL, user, password, 10, 2*time.Second, 5*time.Minute)
+}
+
+// NewWithRetry creates a new Lightstreamer Client with custom retry parameters.
+func NewWithRetry(baseURL, user, password string, maxRetryAttempts int, initialRetryDelay, maxRetryDelay time.Duration) *Client {
 	return &Client{
 		baseURL:  strings.TrimRight(baseURL, "/"),
 		user:     user,
@@ -86,8 +96,11 @@ func New(baseURL, user, password string) *Client {
 		httpClient: &http.Client{
 			Timeout: 0, // streaming – no overall timeout
 		},
-		subscriptions: make(map[int]*subscription),
-		done:          make(chan struct{}),
+		subscriptions:     make(map[int]*subscription),
+		done:              make(chan struct{}),
+		maxRetryAttempts:  maxRetryAttempts,
+		initialRetryDelay: initialRetryDelay,
+		maxRetryDelay:     maxRetryDelay,
 	}
 }
 
@@ -316,6 +329,7 @@ func (c *Client) receive() {
 
 // rebind re-establishes the streaming connection for an existing session after
 // a LOOP message.  It closes done only on unrecoverable errors.
+// Implements exponential backoff with retries.
 func (c *Client) rebind() {
 	// Close and clear the old stream body under the mutex.
 	c.mu.Lock()
@@ -327,41 +341,80 @@ func (c *Client) rebind() {
 	controlURL := c.controlURL
 	c.mu.Unlock()
 
-	// Back-off before rebind attempt.
-	time.Sleep(2 * time.Second)
+	delay := c.initialRetryDelay
+	for attempt := 1; attempt <= c.maxRetryAttempts; attempt++ {
+		if attempt > 1 {
+			// Wait before retry (exponential backoff).
+			time.Sleep(delay)
+			slog.Info("lightstreamer rebind retry",
+				"attempt", attempt,
+				"max_attempts", c.maxRetryAttempts,
+				"delay", delay,
+			)
+		}
 
-	params := url.Values{
-		"LS_session":        {sessionID},
-		"LS_content_length": {contentLength},
-	}
+		params := url.Values{
+			"LS_session":        {sessionID},
+			"LS_content_length": {contentLength},
+		}
 
-	resp, err := c.httpClient.PostForm(controlURL+"/"+pathBind, params)
-	if err != nil {
-		slog.Error("lightstreamer rebind failed", "err", err)
-		c.closeDone()
+		resp, err := c.httpClient.PostForm(controlURL+"/"+pathBind, params)
+		if err != nil {
+			slog.Warn("lightstreamer rebind attempt failed",
+				"attempt", attempt,
+				"max_attempts", c.maxRetryAttempts,
+				"err", err,
+			)
+			delay = c.calculateNextDelay(delay)
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			slog.Warn("lightstreamer rebind HTTP error",
+				"attempt", attempt,
+				"max_attempts", c.maxRetryAttempts,
+				"status", resp.StatusCode,
+			)
+			delay = c.calculateNextDelay(delay)
+			continue
+		}
+
+		// Re-read session header after rebind.
+		if err := c.readSessionHeader(resp.Body); err != nil {
+			resp.Body.Close()
+			slog.Warn("lightstreamer rebind session header error",
+				"attempt", attempt,
+				"max_attempts", c.maxRetryAttempts,
+				"err", err,
+			)
+			delay = c.calculateNextDelay(delay)
+			continue
+		}
+
+		// Success! Update client state and restart receive loop.
+		c.mu.Lock()
+		c.streamBody = resp.Body
+		c.streamScanner = bufio.NewScanner(resp.Body)
+		c.mu.Unlock()
+
+		slog.Info("lightstreamer rebind successful", "attempt", attempt)
+		go c.receive()
 		return
 	}
-	if resp.StatusCode != http.StatusOK {
-		resp.Body.Close()
-		slog.Error("lightstreamer rebind HTTP error", "status", resp.StatusCode)
-		c.closeDone()
-		return
+
+	// All retry attempts exhausted.
+	slog.Error("lightstreamer rebind failed after max attempts", "max_attempts", c.maxRetryAttempts)
+	c.closeDone()
+}
+
+// calculateNextDelay doubles the delay up to maxRetryDelay.
+func (c *Client) calculateNextDelay(currentDelay time.Duration) time.Duration {
+	nextDelay := currentDelay * 2
+	if nextDelay > c.maxRetryDelay {
+		return c.maxRetryDelay
 	}
-
-	// Re-read session header after rebind.
-	if err := c.readSessionHeader(resp.Body); err != nil {
-		resp.Body.Close()
-		slog.Error("lightstreamer rebind session header error", "err", err)
-		c.closeDone()
-		return
-	}
-
-	c.mu.Lock()
-	c.streamBody = resp.Body
-	c.streamScanner = bufio.NewScanner(resp.Body)
-	c.mu.Unlock()
-
-	go c.receive()
+	return nextDelay
 }
 
 // handleUpdate parses a single update line and dispatches it to the matching
