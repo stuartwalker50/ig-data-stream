@@ -344,15 +344,14 @@ func (c *Client) rebind() {
 	delay := c.initialRetryDelay
 	for attempt := 1; attempt <= c.maxRetryAttempts; attempt++ {
 		if attempt > 1 {
+			// Wait before retry (exponential backoff).
+			time.Sleep(delay)
 			slog.Info("lightstreamer rebind retry",
 				"attempt", attempt,
 				"max_attempts", c.maxRetryAttempts,
 				"delay", delay,
 			)
 		}
-
-		// Wait before attempting rebind (exponential backoff).
-		time.Sleep(delay)
 
 		params := url.Values{
 			"LS_session":        {sessionID},
@@ -366,11 +365,7 @@ func (c *Client) rebind() {
 				"max_attempts", c.maxRetryAttempts,
 				"err", err,
 			)
-			// Calculate next delay with exponential backoff.
-			delay = delay * 2
-			if delay > c.maxRetryDelay {
-				delay = c.maxRetryDelay
-			}
+			delay = c.calculateNextDelay(delay)
 			continue
 		}
 
@@ -381,11 +376,7 @@ func (c *Client) rebind() {
 				"max_attempts", c.maxRetryAttempts,
 				"status", resp.StatusCode,
 			)
-			// Calculate next delay with exponential backoff.
-			delay = delay * 2
-			if delay > c.maxRetryDelay {
-				delay = c.maxRetryDelay
-			}
+			delay = c.calculateNextDelay(delay)
 			continue
 		}
 
@@ -397,11 +388,7 @@ func (c *Client) rebind() {
 				"max_attempts", c.maxRetryAttempts,
 				"err", err,
 			)
-			// Calculate next delay with exponential backoff.
-			delay = delay * 2
-			if delay > c.maxRetryDelay {
-				delay = c.maxRetryDelay
-			}
+			delay = c.calculateNextDelay(delay)
 			continue
 		}
 
@@ -419,6 +406,15 @@ func (c *Client) rebind() {
 	// All retry attempts exhausted.
 	slog.Error("lightstreamer rebind failed after max attempts", "max_attempts", c.maxRetryAttempts)
 	c.closeDone()
+}
+
+// calculateNextDelay doubles the delay up to maxRetryDelay.
+func (c *Client) calculateNextDelay(currentDelay time.Duration) time.Duration {
+	nextDelay := currentDelay * 2
+	if nextDelay > c.maxRetryDelay {
+		return c.maxRetryDelay
+	}
+	return nextDelay
 }
 
 // handleUpdate parses a single update line and dispatches it to the matching

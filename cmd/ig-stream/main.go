@@ -137,15 +137,14 @@ func run(ctx context.Context, cfg *config.Config) error {
 			var reconnected bool
 			for attempt := 1; attempt <= cfg.MaxReconnectAttempts; attempt++ {
 				if attempt > 1 {
+					// Wait before retry (exponential backoff)
+					time.Sleep(delay)
 					slog.Info("stream reconnection retry",
 						"attempt", attempt,
 						"max_attempts", cfg.MaxReconnectAttempts,
 						"delay", delay,
 					)
 				}
-
-				// Wait before retry (exponential backoff)
-				time.Sleep(delay)
 
 				// Re-authenticate with IG REST API
 				newSession, err := igClient.CreateSession(cfg.Username, cfg.Password)
@@ -155,10 +154,7 @@ func run(ctx context.Context, cfg *config.Config) error {
 						"max_attempts", cfg.MaxReconnectAttempts,
 						"err", err,
 					)
-					delay = delay * 2
-					if delay > maxDelay {
-						delay = maxDelay
-					}
+					delay = calculateNextDelay(delay, maxDelay)
 					continue
 				}
 
@@ -170,10 +166,7 @@ func run(ctx context.Context, cfg *config.Config) error {
 						"max_attempts", cfg.MaxReconnectAttempts,
 						"err", err,
 					)
-					delay = delay * 2
-					if delay > maxDelay {
-						delay = maxDelay
-					}
+					delay = calculateNextDelay(delay, maxDelay)
 					continue
 				}
 
@@ -550,4 +543,13 @@ func parseInt64(s string) int64 {
 	}
 	n, _ := strconv.ParseInt(s, 10, 64)
 	return n
+}
+
+// calculateNextDelay doubles the delay up to maxDelay for exponential backoff.
+func calculateNextDelay(currentDelay, maxDelay time.Duration) time.Duration {
+	nextDelay := currentDelay * 2
+	if nextDelay > maxDelay {
+		return maxDelay
+	}
+	return nextDelay
 }
