@@ -30,6 +30,8 @@ source .env && ./ig-stream
 | `ZMQ_PUB_ADDR` | | `tcp://127.0.0.1:5555` | ZeroMQ PUB socket bind address |
 | `ZMQ_SUB_ADDR` | | `tcp://127.0.0.1:5556` | ZeroMQ SUB socket bind address (order commands) |
 | `SQLITE_DIR` | | `.` | Directory in which to create price tick databases |
+| `ORDER_PAUSE_HOUR` | | `22` | UTC hour at which order processing is paused (0-23) |
+| `ORDER_RESUME_MINS` | | `30` | Minutes after pause hour before orders resume |
 
 ## Architecture overview
 

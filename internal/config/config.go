@@ -4,6 +4,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -102,7 +103,22 @@ func Load() (*Config, error) {
 	}
 
 	pauseHour := 22
+	if v := os.Getenv("ORDER_PAUSE_HOUR"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 || n > 23 {
+			return nil, fmt.Errorf("ORDER_PAUSE_HOUR must be an integer 0-23, got %q", v)
+		}
+		pauseHour = n
+	}
+
 	resumeMins := 30
+	if v := os.Getenv("ORDER_RESUME_MINS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 || n > 1440 {
+			return nil, fmt.Errorf("ORDER_RESUME_MINS must be an integer 0-1440, got %q", v)
+		}
+		resumeMins = n
+	}
 
 	return &Config{
 		Username:        username,

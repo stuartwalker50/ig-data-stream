@@ -23,11 +23,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -102,50 +104,65 @@ func run(ctx context.Context, cfg *config.Config) error {
 		return err
 	}
 
-	// 6. Start order command reader (respects 22:00 UTC guard).
-	ordersPaused := false
+	// 6. Shared, goroutine-safe order-paused flag.
+	var ordersPaused atomic.Bool
+
+	// 7. Start order command reader in background.
 	go orderCommandLoop(ctx, igClient, pub, &ordersPaused)
 
-	// 7. Nightly guard scheduler.
-	go nightlyGuard(ctx, cfg, func() {
-		ordersPaused = true
-		slog.Info("nightly guard: orders paused, reconnecting stream")
+	// 8. Channels for the nightly guard to signal pause/resume to the main loop.
+	//    Buffered with size 1 so the guard goroutine never blocks.
+	pauseCh := make(chan struct{}, 1)
+	resumeCh := make(chan struct{}, 1)
 
-		lsClient.Disconnect()
+	go nightlyGuard(ctx, cfg, pauseCh, resumeCh)
 
-		// Wait briefly, then re-authenticate and reconnect the stream.
-		time.Sleep(5 * time.Second)
+	// 9. Main event loop – handles guard signals and stream termination from
+	//    a single goroutine to avoid race conditions on lsClient/session.
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("shutdown signal received")
+			lsClient.Disconnect()
+			return nil
 
-		newSession, err := igClient.CreateSession(cfg.Username, cfg.Password)
-		if err != nil {
-			slog.Error("nightly guard: re-auth failed", "err", err)
-			return
+		case <-lsClient.Done():
+			slog.Warn("lightstreamer stream ended unexpectedly; reconnecting")
+			lsClient.Disconnect()
+			newSession, err := igClient.CreateSession(cfg.Username, cfg.Password)
+			if err != nil {
+				return fmt.Errorf("stream reconnect re-auth failed: %w", err)
+			}
+			session = newSession
+			lsClient, err = connectAndSubscribe(cfg, session, pub, priceStore)
+			if err != nil {
+				return fmt.Errorf("stream reconnect failed: %w", err)
+			}
+
+		case <-pauseCh:
+			slog.Info("nightly guard: pausing orders and reconnecting stream")
+			ordersPaused.Store(true)
+			lsClient.Disconnect()
+			time.Sleep(5 * time.Second)
+			newSession, err := igClient.CreateSession(cfg.Username, cfg.Password)
+			if err != nil {
+				slog.Error("nightly guard: re-auth failed", "err", err)
+				continue
+			}
+			session = newSession
+			newLS, err := connectAndSubscribe(cfg, session, pub, priceStore)
+			if err != nil {
+				slog.Error("nightly guard: stream reconnect failed", "err", err)
+				continue
+			}
+			lsClient = newLS
+			slog.Info("nightly guard: stream reconnected")
+
+		case <-resumeCh:
+			ordersPaused.Store(false)
+			slog.Info("nightly guard: orders resumed")
 		}
-		session = newSession
-
-		newLS, err := connectAndSubscribe(cfg, session, pub, priceStore)
-		if err != nil {
-			slog.Error("nightly guard: stream reconnect failed", "err", err)
-			return
-		}
-		lsClient = newLS
-
-		slog.Info("nightly guard: stream reconnected")
-	}, func() {
-		ordersPaused = false
-		slog.Info("nightly guard: orders resumed")
-	})
-
-	// 8. Wait for context cancellation or stream termination.
-	select {
-	case <-ctx.Done():
-		slog.Info("shutdown signal received")
-	case <-lsClient.Done():
-		slog.Warn("lightstreamer stream ended")
 	}
-
-	lsClient.Disconnect()
-	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -331,9 +348,9 @@ func makeTradeListener(pub *publisher.Publisher) lightstreamer.UpdateListener {
 // ---------------------------------------------------------------------------
 
 // orderCommandLoop reads order commands from the ZeroMQ SUB socket and
-// forwards them to IG.  The ordersPaused flag is checked before executing each
-// command.
-func orderCommandLoop(ctx context.Context, igClient *igrest.Client, pub *publisher.Publisher, ordersPaused *bool) {
+// forwards them to IG.  ordersPaused is accessed via atomic load so it is
+// safe to call from a separate goroutine.
+func orderCommandLoop(ctx context.Context, igClient *igrest.Client, pub *publisher.Publisher, ordersPaused *atomic.Bool) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -350,7 +367,7 @@ func orderCommandLoop(ctx context.Context, igClient *igrest.Client, pub *publish
 			continue
 		}
 
-		if *ordersPaused {
+		if ordersPaused.Load() {
 			slog.Warn("order rejected: processing paused (nightly guard)",
 				"epic", cmd.Epic, "direction", cmd.Direction)
 			continue
@@ -384,9 +401,10 @@ func orderCommandLoop(ctx context.Context, igClient *igrest.Client, pub *publish
 // nightly guard
 // ---------------------------------------------------------------------------
 
-// nightlyGuard calls onPause once at OrderPauseHour:00 UTC each day and
-// onResume OrderResumeMins minutes later.
-func nightlyGuard(ctx context.Context, cfg *config.Config, onPause, onResume func()) {
+// nightlyGuard sends to pauseCh at OrderPauseHour:00 UTC each day and to
+// resumeCh OrderResumeMins minutes later.  Channels are buffered so sends
+// never block if the main loop is momentarily busy.
+func nightlyGuard(ctx context.Context, cfg *config.Config, pauseCh, resumeCh chan<- struct{}) {
 	for {
 		now := time.Now().UTC()
 		next := nextOccurrence(now, cfg.OrderPauseHour, 0)
@@ -398,7 +416,11 @@ func nightlyGuard(ctx context.Context, cfg *config.Config, onPause, onResume fun
 		case <-time.After(time.Until(next)):
 		}
 
-		onPause()
+		select {
+		case pauseCh <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
 
 		// Schedule resume.
 		resumeAt := next.Add(time.Duration(cfg.OrderResumeMins) * time.Minute)
@@ -408,7 +430,11 @@ func nightlyGuard(ctx context.Context, cfg *config.Config, onPause, onResume fun
 		case <-time.After(time.Until(resumeAt)):
 		}
 
-		onResume()
+		select {
+		case resumeCh <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 

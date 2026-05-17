@@ -70,7 +70,11 @@ type Client struct {
 	subscriptions   map[int]*subscription
 	streamBody      io.ReadCloser
 	streamScanner   *bufio.Scanner
-	done            chan struct{}
+
+	// done is closed exactly once when the session ends permanently.
+	// It is never replaced; use doneOnce to guard the single close.
+	done     chan struct{}
+	doneOnce sync.Once
 }
 
 // New creates a new Lightstreamer Client.
@@ -112,8 +116,10 @@ func (c *Client) Connect() error {
 		return err
 	}
 
+	c.mu.Lock()
 	c.streamBody = resp.Body
 	c.streamScanner = bufio.NewScanner(resp.Body)
+	c.mu.Unlock()
 
 	go c.receive()
 	return nil
@@ -177,17 +183,16 @@ func (c *Client) Unsubscribe(key int) error {
 // Disconnect closes the streaming connection and signals the background
 // goroutine to exit.
 func (c *Client) Disconnect() {
-	select {
-	case <-c.done:
-	default:
-		close(c.done)
-	}
+	c.closeDone()
+	c.mu.Lock()
 	if c.streamBody != nil {
 		c.streamBody.Close()
 	}
+	c.mu.Unlock()
 }
 
-// Done returns a channel that is closed when the streaming session ends.
+// Done returns a channel that is closed when the streaming session ends
+// permanently (not during a LOOP rebind).
 func (c *Client) Done() <-chan struct{} {
 	return c.done
 }
@@ -195,6 +200,12 @@ func (c *Client) Done() <-chan struct{} {
 // ---------------------------------------------------------------------------
 // internal helpers
 // ---------------------------------------------------------------------------
+
+// closeDone ensures done is closed exactly once, regardless of how many
+// goroutines reach terminal states simultaneously.
+func (c *Client) closeDone() {
+	c.doneOnce.Do(func() { close(c.done) })
+}
 
 // readSessionHeader reads the initial OK line and session key:value pairs from
 // the streaming response body.
@@ -261,22 +272,18 @@ func (c *Client) control(params url.Values) error {
 
 // receive is the background goroutine that reads streaming updates.
 func (c *Client) receive() {
-	defer func() {
-		select {
-		case <-c.done:
-		default:
-			close(c.done)
-		}
-	}()
+	c.mu.Lock()
+	scanner := c.streamScanner
+	c.mu.Unlock()
 
-	for c.streamScanner.Scan() {
+	for scanner.Scan() {
 		select {
 		case <-c.done:
 			return
 		default:
 		}
 
-		line := c.streamScanner.Text()
+		line := scanner.Text()
 		switch {
 		case line == "":
 			// ignore blank lines
@@ -285,12 +292,14 @@ func (c *Client) receive() {
 		case strings.HasPrefix(line, "LOOP"):
 			slog.Info("lightstreamer LOOP – rebinding session")
 			go c.rebind()
-			return
+			return // exit without closing done; rebind will restart receive
 		case strings.HasPrefix(line, "END"):
 			slog.Warn("lightstreamer END – session closed by server", "msg", line)
+			c.closeDone()
 			return
 		case strings.HasPrefix(line, "ERROR"), strings.HasPrefix(line, "SYNC ERROR"):
 			slog.Error("lightstreamer error", "msg", line)
+			c.closeDone()
 			return
 		case strings.HasPrefix(line, "Preamble"):
 			// skip
@@ -299,36 +308,43 @@ func (c *Client) receive() {
 		}
 	}
 
-	if err := c.streamScanner.Err(); err != nil {
+	if err := scanner.Err(); err != nil {
 		slog.Error("lightstreamer stream read error", "err", err)
 	}
+	c.closeDone()
 }
 
 // rebind re-establishes the streaming connection for an existing session after
-// a LOOP message.
+// a LOOP message.  It closes done only on unrecoverable errors.
 func (c *Client) rebind() {
+	// Close and clear the old stream body under the mutex.
+	c.mu.Lock()
 	if c.streamBody != nil {
 		c.streamBody.Close()
+		c.streamBody = nil
 	}
+	sessionID := c.session["SessionId"]
+	controlURL := c.controlURL
+	c.mu.Unlock()
 
 	// Back-off before rebind attempt.
 	time.Sleep(2 * time.Second)
 
 	params := url.Values{
-		"LS_session":        {c.session["SessionId"]},
+		"LS_session":        {sessionID},
 		"LS_content_length": {contentLength},
 	}
 
-	resp, err := c.httpClient.PostForm(c.controlURL+"/"+pathBind, params)
+	resp, err := c.httpClient.PostForm(controlURL+"/"+pathBind, params)
 	if err != nil {
 		slog.Error("lightstreamer rebind failed", "err", err)
-		close(c.done)
+		c.closeDone()
 		return
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
 		slog.Error("lightstreamer rebind HTTP error", "status", resp.StatusCode)
-		close(c.done)
+		c.closeDone()
 		return
 	}
 
@@ -336,13 +352,15 @@ func (c *Client) rebind() {
 	if err := c.readSessionHeader(resp.Body); err != nil {
 		resp.Body.Close()
 		slog.Error("lightstreamer rebind session header error", "err", err)
-		close(c.done)
+		c.closeDone()
 		return
 	}
 
-	c.done = make(chan struct{})
+	c.mu.Lock()
 	c.streamBody = resp.Body
 	c.streamScanner = bufio.NewScanner(resp.Body)
+	c.mu.Unlock()
+
 	go c.receive()
 }
 
