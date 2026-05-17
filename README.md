@@ -1,5 +1,129 @@
 # ig-data-stream
 
+A Go service that connects to IG Markets via the Lightstreamer Streaming API,
+publishes normalised market data over ZeroMQ, and executes order commands
+received from strategy services.
+
+## Quick start
+
+```bash
+# Copy and edit the environment file
+cp .env.example .env   # see Environment variables section below
+
+# Build
+go build -o ig-stream ./cmd/ig-stream
+
+# Run
+source .env && ./ig-stream
+```
+
+## Environment variables
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `IG_USERNAME` | ✓ | – | IG account username |
+| `IG_PASSWORD` | ✓ | – | IG account password |
+| `IG_API_KEY` | ✓ | – | IG API key |
+| `IG_ACC_NUMBER` | ✓ | – | IG account number (e.g. `ZXXXXX`) |
+| `IG_ACC_TYPE` | | `DEMO` | `LIVE` or `DEMO` |
+| `IG_EPICS` | ✓ | – | Comma-separated list of epics to subscribe |
+| `ZMQ_PUB_ADDR` | | `tcp://127.0.0.1:5555` | ZeroMQ PUB socket bind address |
+| `ZMQ_SUB_ADDR` | | `tcp://127.0.0.1:5556` | ZeroMQ SUB socket bind address (order commands) |
+| `SQLITE_DIR` | | `.` | Directory in which to create price tick databases |
+
+## Architecture overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         ig-stream (Go)                          │
+│                                                                  │
+│  IG REST API  ──► igrest.Client ──► session tokens             │
+│                                       │                          │
+│  Lightstreamer  ──► ls.Client ──► PRICE/ACCOUNT/TRADE subs     │
+│    (HTTP text                         │                          │
+│     protocol)                    ┌────┴──────────────────┐      │
+│                                  │  publisher (ZeroMQ)   │      │
+│                                  │  PUB: prices/account/ │◄──── SQLite store │
+│                                  │       trades          │      │
+│                                  │  SUB: order commands  │      │
+│                                  └───────────────────────┘      │
+│                                                                  │
+│  22:00 UTC guard: pause orders, reconnect stream session        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## ZeroMQ message format
+
+Every published message is a two-frame ZeroMQ message: `[topic, JSON]`.
+
+**Topics**: `prices`, `account`, `trades`
+
+**Envelope** (JSON):
+```json
+{
+  "type": "prices",
+  "account_mode": "demo",
+  "account_id": "ZXXXXX",
+  "epic": "CS.D.EURUSD.MINI.IP",
+  "ts": "2026-05-17T18:00:00.000000000Z",
+  "payload": { ... }
+}
+```
+
+**Price payload**:
+```json
+{ "bid": 1.085, "ask": 1.0852, "net_chg": 0.0002,
+  "net_chg_pct": 0.02, "high": 1.09, "low": 1.075, "state": "tradeable" }
+```
+
+**Order command** (sent to the SUB socket by strategy services):
+```json
+{ "epic": "CS.D.EURUSD.MINI.IP", "direction": "BUY", "size": 1.0,
+  "order_type": "MARKET", "currency_code": "USD",
+  "expiry": "-", "force_open": true, "guaranteed_stop": false }
+```
+
+## Lightstreamer subscriptions
+
+Uses the **new PRICE subscription** (`PRICE:{account}:{epic}` / adapter `Pricing`)
+which replaced the deprecated `MARKET:` subscription decommissioned 2026-05-08
+([trading-ig#357](https://github.com/ig-python/trading-ig/issues/357)).
+
+| Subscription | Mode | Items | Fields |
+|---|---|---|---|
+| Price | MERGE | `PRICE:{acc}:{epic}` | TIMESTAMP, BIDPRICE1, ASKPRICE1, NET_CHG, DLG_FLAG, NET_CHG_, HIGH, LOW |
+| Account | MERGE | `ACCOUNT:{acc}` | FUNDS, MARGIN, AVAILABLE_TO_DEAL, PNL, EQUITY, EQUITY_USED |
+| Trade | DISTINCT | `TRADE:{acc}` | CONFIRMS, OPU, WOU |
+
+## SQLite price store
+
+A new database file `prices_YYYYMMDD_HHMMSS.db` is created on each run.
+Each file contains a `prices` table suitable for backtesting:
+
+```sql
+CREATE TABLE prices (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    received_at  TEXT    NOT NULL,   -- UTC RFC3339 timestamp
+    epic         TEXT    NOT NULL,
+    ig_ts_ms     INTEGER NOT NULL,   -- IG TIMESTAMP (ms since epoch)
+    bid          REAL    NOT NULL,
+    ask          REAL    NOT NULL,
+    high         REAL,
+    low          REAL
+);
+```
+
+## 22:00 UTC nightly guard
+
+Order execution is paused at 22:00 UTC and the Lightstreamer session is
+disconnected and reconnected to keep session tokens valid.  Orders resume at
+22:30 UTC.  Orders received during the pause window are rejected with a log
+warning.
+
+---
+
+## Architecture decision brief
+
 Analysis and implementation guidance for an IG Markets streaming/order pipeline.
 
 ## Functional scope (from issue)

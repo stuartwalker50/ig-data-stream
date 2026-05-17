@@ -1,0 +1,12 @@
+# Go build output
+/ig-stream
+cmd/ig-stream/ig-stream
+
+# SQLite price databases (created at runtime)
+*.db
+
+# Go test cache
+*.test
+
+# Vendor directory (not used in this repo)
+vendor/
