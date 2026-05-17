@@ -17,6 +17,9 @@ go build -o ig-stream ./cmd/ig-stream
 source .env && ./ig-stream
 ```
 
+> `ig-stream` reads exported environment variables. The `.env.example` file
+> uses `export` so `source .env` makes values visible to the process.
+
 ## Environment variables
 
 | Variable | Required | Default | Description |
