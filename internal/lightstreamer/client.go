@@ -322,7 +322,16 @@ func (c *Client) receive() {
 	}
 
 	if err := scanner.Err(); err != nil {
-		slog.Error("lightstreamer stream read error", "err", err)
+		// Check whether the error was caused by an intentional shutdown
+		// (Disconnect closed the body while receive was blocked in Scan).
+		// In that case the "use of closed network connection" error is
+		// expected and should not be treated as a fault.
+		select {
+		case <-c.done:
+			slog.Debug("lightstreamer stream closed", "err", err)
+		default:
+			slog.Error("lightstreamer stream read error", "err", err)
+		}
 	}
 	c.closeDone()
 }
