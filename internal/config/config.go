@@ -97,7 +97,7 @@ func Load() (*Config, error) {
 	}
 
 	epics := []string{}
-	for _, e := range strings.Split(epicsRaw, ",") {
+	for _, e := range strings.Split(strings.Trim(epicsRaw, "[]"), ",") {
 		e = strings.TrimSpace(e)
 		if e != "" {
 			epics = append(epics, e)
